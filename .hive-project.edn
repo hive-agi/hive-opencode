@@ -1,0 +1,5 @@
+{:project-id "opencode-emacs"
+ :parent "hive"
+ :description "OpenCode backend for Emacs via ClojureElisp — spawns opencode in vterm with hive-mcp bridge"
+ :language :clojure-elisp
+ :tags ["opencode" "emacs" "cljel" "vterm" "ling"]}

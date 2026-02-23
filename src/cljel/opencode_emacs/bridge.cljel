@@ -1,0 +1,259 @@
+(ns opencode-emacs.bridge
+  "Core bridge between Emacs and OpenCode.
+
+   Spawns opencode processes inside vterm buffers, manages their lifecycle,
+   injects per-session .opencode.json config (with hive-mcp wired in),
+   and provides dispatch/kill/status operations.
+
+   This is the main entry point — called from hive-mcp swarm elisp
+   or interactively via M-x opencode-emacs-bridge-spawn.")
+
+;; ============================================================================
+;; State
+;; ============================================================================
+
+(def sessions (make-hash-table :test 'equal))
+
+(def buffer-prefix "*opencode:")
+
+;; ============================================================================
+;; Customizable
+;; ============================================================================
+
+(defvar opencode-emacs-bridge-command "opencode"
+  "Path to the opencode binary.")
+
+(defvar opencode-emacs-bridge-default-model "anthropic/claude-sonnet-4-20250514"
+  "Default model for opencode sessions.")
+
+(defvar opencode-emacs-bridge-permission-mode "bypass"
+  "Permission mode: bypass or prompt.")
+
+;; ============================================================================
+;; Private Helpers
+;;
+;; Note: These compile to opencode-emacs-bridge--<name> (double-dash).
+;; Callers within this ns use the fully-qualified emitted name directly
+;; since cljel does not yet resolve intra-ns private calls automatically.
+;; ============================================================================
+
+(defn- session-get [session-id key]
+  "Get KEY from session SESSION-ID."
+  (let [session (gethash session-id opencode-emacs-bridge-sessions)]
+    (when session
+      (plist-get session key))))
+
+(defn- session-put [session-id key value]
+  "Set KEY to VALUE in session SESSION-ID."
+  (let [session (or (gethash session-id opencode-emacs-bridge-sessions) '())]
+    (puthash session-id (plist-put session key value) opencode-emacs-bridge-sessions)))
+
+(defn- session-register [session-id props]
+  "Register a new session with initial PROPS plist."
+  (puthash session-id props opencode-emacs-bridge-sessions))
+
+(defn- session-remove [session-id]
+  "Remove session SESSION-ID from registry."
+  (remhash session-id opencode-emacs-bridge-sessions))
+
+(defn- build-env [session-id cwd agent-id]
+  "Build process-environment additions for an opencode session."
+  (let [env (list (format "OPENCODE_SESSION_ID=%s" session-id))]
+    (when agent-id
+      (setq env (cons (format "CLAUDE_SWARM_SLAVE_ID=%s" agent-id) env))
+      (setq env (cons (format "OPENCODE_AGENT_ID=%s" agent-id) env)))
+    (when cwd
+      (setq env (cons (format "OPENCODE_CWD=%s" cwd) env)))
+    env))
+
+(defn- build-command [cwd config-dir opts]
+  "Build the opencode shell command string.
+   OPTS is a plist with :model, :continue, :session-id, :prompt, :agent."
+  (let [cmd (list opencode-emacs-bridge-command)
+        model (plist-get opts :model)
+        continue-p (plist-get opts :continue)
+        session (plist-get opts :session-id)
+        prompt-str (plist-get opts :prompt)
+        agent-name (plist-get opts :agent)]
+    ;; Set working directory
+    (when cwd
+      (setq cmd (append cmd (list "-c" cwd))))
+    ;; Model
+    (when model
+      (setq cmd (append cmd (list "-m" model))))
+    ;; Continue last session
+    (when continue-p
+      (setq cmd (append cmd (list "--continue"))))
+    ;; Specific session
+    (when session
+      (setq cmd (append cmd (list "-s" session))))
+    ;; Agent
+    (when agent-name
+      (setq cmd (append cmd (list "--agent" agent-name))))
+    ;; System prompt file
+    (when prompt-str
+      (let [prompt-file (make-temp-file "opencode-prompt-" nil ".md")]
+        (with-temp-file prompt-file
+          (insert prompt-str))
+        (setq cmd (append cmd (list "--prompt" prompt-file)))))
+    (mapconcat 'shell-quote-argument cmd " ")))
+
+(defn- make-buffer-name [bname]
+  "Create buffer name for an opencode session."
+  (format "%s%s*" opencode-emacs-bridge-buffer-prefix bname))
+
+;; ============================================================================
+;; Spawn
+;; ============================================================================
+
+(defn spawn [name cwd opts]
+  "Spawn an opencode process in a vterm buffer.
+
+   NAME     - Session display name (used for buffer naming)
+   CWD      - Working directory for opencode
+   OPTS     - Plist with optional keys:
+     :model      - LLM model string
+     :agent-id   - Hive agent ID (for swarm integration)
+     :prompt     - System prompt string (written to temp file)
+     :mcp-servers - Extra MCP server alist
+     :continue   - If non-nil, continue last session
+     :session-id - Specific opencode session to resume
+
+   Returns the session-id string."
+  (let [session-id (or (plist-get opts :agent-id)
+                       (format "oc-%s-%d" name (float-time)))
+        agent-id (plist-get opts :agent-id)
+        model (or (plist-get opts :model) opencode-emacs-bridge-default-model)
+        work-dir (or cwd default-directory)
+        buf-name (opencode-emacs-bridge--make-buffer-name name)]
+
+    ;; 1. Generate .opencode.json config in the working directory
+    (require 'opencode-emacs-config)
+    (let [config-opts (list :model model
+                            :agent-id agent-id
+                            :mcp-servers (plist-get opts :mcp-servers))]
+      (opencode-emacs-config-write-config work-dir config-opts))
+
+    ;; 2. Register session
+    (opencode-emacs-bridge--session-register session-id
+                       (list :name name
+                             :cwd work-dir
+                             :buffer-name buf-name
+                             :agent-id agent-id
+                             :model model
+                             :status 'spawning
+                             :created-at (current-time)))
+
+    ;; 3. Create vterm buffer and send command
+    (let [buffer (generate-new-buffer buf-name)
+          env-additions (opencode-emacs-bridge--build-env session-id work-dir agent-id)
+          cmd-str (opencode-emacs-bridge--build-command work-dir work-dir
+                                  (list :model model
+                                        :continue (plist-get opts :continue)
+                                        :session-id (plist-get opts :session-id)
+                                        :prompt (plist-get opts :prompt)
+                                        :agent (plist-get opts :agent)))]
+
+      (opencode-emacs-bridge--session-put session-id :buffer buffer)
+
+      (with-current-buffer buffer
+        (let [default-directory work-dir
+              process-environment (append env-additions process-environment)]
+          (vterm-mode)
+          ;; Send command after vterm initializes
+          (run-at-time 0.5 nil
+            (lambda (_unused)
+              (when (buffer-live-p buffer)
+                (with-current-buffer buffer
+                  (vterm-send-string cmd-str)
+                  (vterm-send-return))
+                (opencode-emacs-bridge--session-put session-id :status 'running))))))
+
+      ;; 4. Display buffer
+      (display-buffer buffer)
+
+      session-id)))
+
+;; ============================================================================
+;; Lifecycle
+;; ============================================================================
+
+(defn kill [session-id]
+  "Kill the opencode session identified by SESSION-ID.
+   Sends Ctrl-C then kills the buffer."
+  (let [buffer (opencode-emacs-bridge--session-get session-id :buffer)]
+    (when (and buffer (buffer-live-p buffer))
+      (with-current-buffer buffer
+        ;; Send Ctrl-C to gracefully stop opencode
+        (vterm-send-key "c" nil nil t)
+        ;; Give it a moment, then kill
+        (run-at-time 1.0 nil
+          (lambda (_unused)
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))
+    (opencode-emacs-bridge--session-put session-id :status 'killed)
+    (list :killed session-id)))
+
+(defn send [session-id text]
+  "Send TEXT to a running opencode session.
+   Useful for dispatching follow-up prompts."
+  (let [buffer (opencode-emacs-bridge--session-get session-id :buffer)]
+    (when (and buffer (buffer-live-p buffer))
+      (with-current-buffer buffer
+        (vterm-send-string text)
+        (vterm-send-return))
+      (list :sent t :session-id session-id))))
+
+(defn status [session-id]
+  "Return status plist for SESSION-ID."
+  (let [session (gethash session-id opencode-emacs-bridge-sessions)]
+    (when session
+      (let [buffer (plist-get session :buffer)
+            alive (and buffer (buffer-live-p buffer))]
+        (list :session-id session-id
+              :name (plist-get session :name)
+              :status (if alive
+                        (plist-get session :status)
+                        'dead)
+              :cwd (plist-get session :cwd)
+              :model (plist-get session :model)
+              :agent-id (plist-get session :agent-id)
+              :buffer-alive alive)))))
+
+(defn list-sessions []
+  "Return a list of all registered session status plists."
+  (let [result '()]
+    (maphash (lambda (id _val)
+               (setq result (cons (opencode-emacs-bridge-status id) result)))
+             opencode-emacs-bridge-sessions)
+    result))
+
+;; ============================================================================
+;; API for hive-mcp swarm integration
+;; ============================================================================
+
+(defn api-spawn [name presets cwd agent-id]
+  "API entry point for hive-mcp swarm.
+
+   Compatible with the hive-mcp-swarm-api-spawn calling convention.
+   NAME      - Agent name
+   PRESETS   - List of preset names (used to build system prompt)
+   CWD       - Working directory
+   AGENT-ID  - Hive agent slave-id
+
+   Returns the session-id."
+  (let [;; Build system prompt from presets if available
+        prompt (when presets
+                 (condition-case _err
+                     (when (fboundp 'hive-mcp-swarm-presets-build-system-prompt)
+                       (hive-mcp-swarm-presets-build-system-prompt presets nil))
+                   (error nil)))
+        ;; Add identity section
+        identity-str (format "## YOUR IDENTITY AND ENVIRONMENT\n**Agent ID:** `%s`\n**Working directory:** `%s`\n\n"
+                         (or agent-id name) (or cwd default-directory))
+        full-prompt (if prompt
+                      (concat identity-str prompt)
+                      identity-str)]
+    (opencode-emacs-bridge-spawn name cwd
+           (list :agent-id agent-id
+                 :prompt full-prompt))))

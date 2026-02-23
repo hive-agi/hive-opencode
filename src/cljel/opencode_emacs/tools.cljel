@@ -1,0 +1,135 @@
+(ns opencode-emacs.tools
+  "Emacs-native tools exposed to opencode via its MCP integration.
+
+   When opencode connects to hive-mcp, it gets the standard hive tools.
+   This module provides *additional* Emacs-side capabilities that opencode
+   can use via a lightweight local MCP server or direct elisp eval:
+
+   - Buffer inspection (list open buffers, read buffer contents)
+   - Emacs eval (execute elisp from opencode)
+   - Window/frame management
+   - File operations via Emacs (respecting Emacs hooks and modes)
+
+   These are registered as tools that hive-mcp's emacs addon exposes,
+   or can be served as a standalone MCP server via opencode-emacs.mcp.")
+
+;; ============================================================================
+;; Buffer Tools
+;; ============================================================================
+
+(defn buffer-list-info []
+  "Return info about all live buffers.
+   Result: list of (:name NAME :file FILE :modified BOOL :major-mode MODE :size SIZE)."
+  (let [result '()]
+    (dolist (buf (buffer-list) result)
+      (when (buffer-live-p buf)
+        (let [name (buffer-name buf)
+              file (buffer-file-name buf)
+              modified (buffer-modified-p buf)
+              mode (with-current-buffer buf (symbol-name major-mode))
+              size (buffer-size buf)]
+          ;; Skip internal buffers
+          (unless (string-prefix-p " " name)
+            (setq result
+                  (cons (list :name name
+                              :file file
+                              :modified modified
+                              :major-mode mode
+                              :size size)
+                        result))))))))
+
+(defn buffer-contents [buffer-name-or-file]
+  "Read contents of a buffer by name or file path.
+   Returns (:content STRING :name NAME) or (:error STRING)."
+  (condition-case err
+      (let [buf (or (get-buffer buffer-name-or-file)
+                    (find-buffer-visiting buffer-name-or-file))]
+        (if buf
+          (list :content (with-current-buffer buf
+                           (buffer-substring-no-properties (point-min) (point-max)))
+                :name (buffer-name buf))
+          (list :error (format "Buffer not found: %s" buffer-name-or-file))))
+    (error
+     (list :error (format "Error reading buffer: %s" (error-message-string err))))))
+
+(defn buffer-region [buffer-name start-line end-line]
+  "Read a region of BUFFER-NAME from START-LINE to END-LINE (1-based).
+   Returns (:content STRING :lines N) or (:error STRING)."
+  (condition-case err
+      (let [buf (get-buffer buffer-name)]
+        (if buf
+          (with-current-buffer buf
+            (save-excursion
+              (goto-char (point-min))
+              (forward-line (1- start-line))
+              (let [start (point)]
+                (forward-line (- end-line start-line))
+                (end-of-line)
+                (list :content (buffer-substring-no-properties start (point))
+                      :lines (- end-line start-line -1)))))
+          (list :error (format "Buffer not found: %s" buffer-name))))
+    (error
+     (list :error (format "Error reading region: %s" (error-message-string err))))))
+
+;; ============================================================================
+;; Eval Tools
+;; ============================================================================
+
+(defn eval-expression [expr-string]
+  "Evaluate an elisp expression string.
+   Returns (:result STRING) or (:error STRING).
+   WARNING: This executes arbitrary code in Emacs."
+  (condition-case err
+      (let [form (car (read-from-string expr-string))
+            result (eval form t)]
+        (list :result (format "%S" result)))
+    (error
+     (list :error (format "Eval error: %s" (error-message-string err))))))
+
+;; ============================================================================
+;; Window / Frame Tools
+;; ============================================================================
+
+(defn window-layout []
+  "Return the current window layout.
+   Result: list of (:buffer NAME :width W :height H :dedicated BOOL)."
+  (let [result '()]
+    (walk-windows
+     (lambda (w)
+       (setq result
+             (cons (list :buffer (buffer-name (window-buffer w))
+                         :width (window-width w)
+                         :height (window-height w)
+                         :dedicated (window-dedicated-p w))
+                   result)))
+     nil t)
+    result))
+
+;; ============================================================================
+;; Project Tools
+;; ============================================================================
+
+(defn project-files [root pattern]
+  "List project files matching PATTERN under ROOT.
+   Uses `directory-files-recursively` from Emacs 25+."
+  (condition-case err
+      (let [files (directory-files-recursively root pattern)]
+        (list :root root
+              :count (length files)
+              :files (if (> (length files) 500)
+                       (seq-take files 500)
+                       files)))
+    (error
+     (list :error (format "Error listing files: %s" (error-message-string err))))))
+
+(defn git-status [root]
+  "Return git status for the project at ROOT.
+   Uses shell command, does not require magit."
+  (condition-case err
+      (let [default-directory (expand-file-name root)
+            output (shell-command-to-string "git status --porcelain 2>/dev/null")]
+        (list :root root
+              :clean (string-empty-p (string-trim output))
+              :output output))
+    (error
+     (list :error (format "Git status error: %s" (error-message-string err))))))

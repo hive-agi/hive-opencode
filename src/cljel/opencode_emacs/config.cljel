@@ -1,0 +1,104 @@
+(ns opencode-emacs.config
+  "OpenCode configuration management.
+
+   Generates and manages .opencode.json config files for opencode sessions,
+   wiring in hive-mcp and other MCP servers, setting model preferences,
+   and configuring the shell environment.
+
+   Config is generated per-session in a temp directory to avoid polluting
+   the user's project directory.")
+
+;; ============================================================================
+;; Defaults
+;; ============================================================================
+
+(def default-model "anthropic/claude-sonnet-4-20250514")
+
+(def default-shell-path "/bin/bash")
+
+(def hive-mcp-command "bb")
+
+(def hive-mcp-args '("--config" "/home/lages/PP/hive/hive-mcp/bb.edn" "-m" "hive-mcp.main"))
+
+;; ============================================================================
+;; Private Helpers
+;; ============================================================================
+
+(defn- json-encode-alist [alist]
+  "Encode an alist as JSON string using Emacs json.el."
+  (require 'json)
+  (json-encode alist))
+
+(defn- make-mcp-server-entry [mcp-name command args env]
+  "Build a single MCP server config entry."
+  (let [entry (list (cons "type" "stdio")
+                    (cons "command" command)
+                    (cons "args" (apply 'vector args)))]
+    (if env
+      (append entry (list (cons "env" env)))
+      entry)))
+
+;; ============================================================================
+;; Public API
+;; ============================================================================
+
+(defn hive-mcp-server-config []
+  "Return the hive-mcp server configuration alist."
+  (opencode-emacs-config--make-mcp-server-entry
+   "hive-mcp"
+   opencode-emacs-config-hive-mcp-command
+   opencode-emacs-config-hive-mcp-args
+   nil))
+
+(defn generate-config [opts]
+  "Generate an .opencode.json config alist.
+
+   OPTS is a plist with optional keys:
+     :model       - Model string (default: anthropic/claude-sonnet-4)
+     :mcp-servers - Extra MCP server alist to merge
+     :shell       - Shell path (default: /bin/bash)
+     :cwd         - Working directory
+     :agent-id    - Hive agent ID (injected as env var)"
+  (let [model (or (plist-get opts :model) opencode-emacs-config-default-model)
+        shell-path (or (plist-get opts :shell) opencode-emacs-config-default-shell-path)
+        extra-mcp (plist-get opts :mcp-servers)
+        agent-id (plist-get opts :agent-id)
+        ;; Build MCP servers map
+        mcp-servers (list (cons "hive-mcp" (opencode-emacs-config-hive-mcp-server-config)))
+        mcp-servers (if extra-mcp
+                      (append mcp-servers extra-mcp)
+                      mcp-servers)
+        ;; Build agents config
+        agents (list (cons "coder"
+                           (list (cons "model" model)
+                                 (cons "maxTokens" 16000)))
+                     (cons "task"
+                           (list (cons "model" model)
+                                 (cons "maxTokens" 8000)))
+                     (cons "title"
+                           (list (cons "model" model)
+                                 (cons "maxTokens" 80))))]
+    ;; Build top-level config
+    (list (cons "mcpServers" mcp-servers)
+          (cons "agents" agents)
+          (cons "shell" (list (cons "path" shell-path)
+                              (cons "args" (vector "-l"))))
+          (cons "autoCompact" t))))
+
+(defn write-config [dir opts]
+  "Write .opencode.json to DIR based on OPTS.
+   Returns the path to the written config file."
+  (let [config (opencode-emacs-config-generate-config opts)
+        json-str (opencode-emacs-config--json-encode-alist config)
+        config-path (expand-file-name ".opencode.json" dir)]
+    (with-temp-file config-path
+      (insert json-str))
+    config-path))
+
+(defn ensure-session-dir [base-dir session-name]
+  "Create a session-specific config directory under BASE-DIR.
+   Returns the directory path."
+  (let [dir (expand-file-name (format "opencode-sessions/%s" session-name)
+                              (or base-dir temporary-file-directory))]
+    (make-directory dir t)
+    dir))

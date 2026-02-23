@@ -1,0 +1,6 @@
+.cpcache/
+.lsp/
+.clj-kondo/.cache/
+*.elc
+local.deps.edn
+.nrepl-port
