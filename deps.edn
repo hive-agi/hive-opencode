@@ -1,5 +1,5 @@
 {:paths ["src/cljel" "resources"]
- :deps {io.github.lages/clojure-elisp {:local/root "/home/lages/PP/clojure-elisp"}}
+ :deps {io.github.BuddhiLW/clojure-elisp {:git/tag "v0.4.0" :git/sha "d42b941"}}
  :aliases
- {:build {:extra-deps {io.github.lages/clojure-elisp {:local/root "/home/lages/PP/clojure-elisp"}}
+ {:build {:extra-deps {io.github.BuddhiLW/clojure-elisp {:git/tag "v0.4.0" :git/sha "d42b941"}}
           :main-opts ["-m" "clojure-elisp.core"]}}}
