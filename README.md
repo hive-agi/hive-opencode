@@ -1,5 +1,14 @@
 # hive-opencode
 
+<!-- hive-badges -->
+
+[![Clojars Project](https://img.shields.io/clojars/v/io.github.hive-agi/hive-opencode.svg)](https://clojars.org/io.github.hive-agi/hive-opencode)
+[![cljdoc](https://cljdoc.org/badge/io.github.hive-agi/hive-opencode)](https://cljdoc.org/d/io.github.hive-agi/hive-opencode/CURRENT)
+[![release](https://github.com/hive-agi/hive-opencode/actions/workflows/release.yml/badge.svg)](https://github.com/hive-agi/hive-opencode/actions/workflows/release.yml)
+[![License: EPL-2.0](https://img.shields.io/badge/License-EPL--2.0-blue.svg)](https://www.eclipse.org/legal/epl-2.0/)
+
+<!-- /hive-badges -->
+
 Terminal bridge for [OpenCode](https://github.com/opencode-ai/opencode) in the [hive](https://github.com/hive-agi) ecosystem. Spawns and manages OpenCode sessions inside Emacs vterm buffers (or any terminal host) with hive-mcp wired in as an MCP server.
 
 ## What it does
