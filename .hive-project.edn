@@ -2,4 +2,5 @@
  :parent "hive"
  :description "OpenCode backend for Emacs via ClojureElisp — spawns opencode in vterm with hive-mcp bridge"
  :language :clojure-elisp
- :tags ["opencode" "emacs" "cljel" "vterm" "ling"]}
+ :tags ["opencode" "emacs" "cljel" "vterm" "ling"] 
+ :carto {:source-roots ["resources" "src" "src/cljel"]}}
